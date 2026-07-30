@@ -21,10 +21,13 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_sock import Sock
 from flask_cors import CORS
 from simple_websocket import Server as _WsServer
-from urllib.parse import urlencode
-import websocket
+import json
 import toml
 from dotenv import load_dotenv
+
+from deepgram import DeepgramClient
+from deepgram.core.events import EventType
+from deepgram.listen.v2.types import ListenV2CloseStream
 
 # Monkey-patch simple-websocket to echo back the access_token.* subprotocol.
 # flask-sock uses simple-websocket's Server class for the WebSocket handshake.
@@ -107,6 +110,24 @@ def validate_api_key():
 
 # Validate on startup
 API_KEY = validate_api_key()
+
+# One SDK client, reused across connections; the browser never sees the API key.
+deepgram = DeepgramClient(api_key=API_KEY)
+
+
+def _forward_to_browser(ws, message):
+    """Forward one Deepgram message to the browser: bytes as binary, models as JSON."""
+    try:
+        if isinstance(message, (bytes, bytearray)):
+            ws.send(bytes(message))
+        elif isinstance(message, dict):
+            ws.send(json.dumps(message))
+        elif hasattr(message, "model_dump_json"):
+            ws.send(message.model_dump_json())
+        else:
+            ws.send(json.dumps({"type": getattr(message, "type", "Unknown")}))
+    except Exception as e:
+        print(f"Error forwarding to browser: {e}")
 
 # ============================================================================
 # SETUP - Initialize Flask, WebSocket, and CORS
@@ -219,7 +240,7 @@ def flux(ws):
     # Get query parameters from request
     model = DEFAULT_MODEL
     encoding = request.args.get('encoding', 'linear16')
-    sample_rate = request.args.get('sample_rate', '16000')
+    sample_rate = int(request.args.get('sample_rate', '16000'))
     eot_threshold = request.args.get('eot_threshold')
     eager_eot_threshold = request.args.get('eager_eot_threshold')
     eot_timeout_ms = request.args.get('eot_timeout_ms')
@@ -227,133 +248,74 @@ def flux(ws):
 
     print(f"Flux Config - model: {model}, encoding: {encoding}, sample_rate: {sample_rate}")
 
-    # Build Deepgram WebSocket URL with query parameters
-    deepgram_params = {
-        'model': model,
-        'encoding': encoding,
-        'sample_rate': sample_rate,
+    # Build the Flux (listen.v2) connection options, coercing numeric params.
+    connect_kwargs = {
+        "model": model,
+        "encoding": encoding,
+        "sample_rate": sample_rate,
     }
     if eot_threshold:
-        deepgram_params['eot_threshold'] = eot_threshold
+        connect_kwargs["eot_threshold"] = float(eot_threshold)
     if eager_eot_threshold:
-        deepgram_params['eager_eot_threshold'] = eager_eot_threshold
+        connect_kwargs["eager_eot_threshold"] = float(eager_eot_threshold)
     if eot_timeout_ms:
-        deepgram_params['eot_timeout_ms'] = eot_timeout_ms
+        connect_kwargs["eot_timeout_ms"] = int(eot_timeout_ms)
+    if keyterms:
+        connect_kwargs["keyterm"] = keyterms
 
-    # Build URL with urlencode, then append multi-value keyterm params
-    deepgram_url = f"wss://api.deepgram.com/v2/listen?{urlencode(deepgram_params)}"
-    for term in keyterms:
-        deepgram_url += f"&keyterm={term}"
-
-    # Message counters for logging
-    client_message_count = 0
-    deepgram_message_count = 0
     stop_event = threading.Event()
-    deepgram_ready = threading.Event()
 
-    def on_deepgram_message(dg_ws, message):
-        """Forward messages from Deepgram to client"""
-        nonlocal deepgram_message_count
-
-        # Wait for client to be ready before forwarding
-        if not deepgram_ready.wait(timeout=5):
-            print("Timeout waiting for client to be ready")
-            stop_event.set()
-            return
-
-        deepgram_message_count += 1
-
-        # Log every 10th message or non-binary messages
-        if deepgram_message_count % 10 == 0 or isinstance(message, str):
-            print(f"<- Deepgram message #{deepgram_message_count}")
-
-        try:
-            ws.send(message)
-        except Exception as e:
-            print(f"Error forwarding to client: {e}")
-            stop_event.set()
-
-    def on_deepgram_error(dg_ws, error):
-        """Handle Deepgram errors"""
-        print(f"Deepgram error: {error}")
-        stop_event.set()
-
-    def on_deepgram_close(dg_ws, close_status_code, close_msg):
-        """Handle Deepgram connection close"""
-        print(f"Deepgram connection closed: {close_status_code} {close_msg}")
-        stop_event.set()
-
-    def on_deepgram_open(dg_ws):
-        """Handle Deepgram connection open"""
-        print("Connected to Deepgram Flux API")
-
-    # Create WebSocket connection to Deepgram
+    # Bridge browser <-> Deepgram Flux (listen.v2) through the official SDK.
     try:
-        deepgram_ws = websocket.WebSocketApp(
-            deepgram_url,
-            header={
-                'Authorization': f'Token {API_KEY}'
-            },
-            on_open=on_deepgram_open,
-            on_message=on_deepgram_message,
-            on_error=on_deepgram_error,
-            on_close=on_deepgram_close
-        )
+        with deepgram.listen.v2.connect(**connect_kwargs) as connection:
+            connection.on(EventType.MESSAGE, lambda m: _forward_to_browser(ws, m))
+            connection.on(EventType.CLOSE, lambda _: stop_event.set())
+            connection.on(EventType.ERROR, lambda e: (print(f"Deepgram error: {e}"), stop_event.set()))
 
-        # Run Deepgram WebSocket in background thread
-        dg_thread = threading.Thread(target=deepgram_ws.run_forever)
-        dg_thread.daemon = True
-        dg_thread.start()
+            # start_listening() blocks, so run it in a background thread while the
+            # main thread forwards browser audio/control messages to Deepgram.
+            threading.Thread(target=connection.start_listening, daemon=True).start()
+            print("Ready to forward messages")
 
-        # Wait a moment for Deepgram connection to initialize
-        time.sleep(0.1)
-
-        # Signal that we're ready to receive Deepgram messages
-        deepgram_ready.set()
-        print("Ready to forward messages")
-
-        # Forward messages from client to Deepgram
-        while not stop_event.is_set():
-            try:
-                # Receive message from client (with timeout)
-                message = ws.receive(timeout=0.1)
+            while not stop_event.is_set():
+                try:
+                    message = ws.receive(timeout=0.1)
+                except Exception:
+                    break  # client disconnected
                 if message is None:
                     continue
 
-                client_message_count += 1
+                # Browser audio arrives as binary; forward it as media.
+                if isinstance(message, (bytes, bytearray)):
+                    connection.send_media(bytes(message))
+                    continue
 
-                # Log every 100th binary message
-                if client_message_count % 100 == 0:
-                    print(f"-> Client message #{client_message_count}")
+                # Text frames are JSON control messages from the browser.
+                try:
+                    data = json.loads(message)
+                except (ValueError, TypeError):
+                    print("Ignoring non-JSON message from client")
+                    continue
 
-                # Forward to Deepgram
-                if isinstance(message, bytes):
-                    deepgram_ws.send(message, opcode=websocket.ABNF.OPCODE_BINARY)
-                else:
-                    deepgram_ws.send(message)
-
-            except Exception as e:
-                if "timeout" not in str(e).lower():
-                    print(f"Error in client message loop: {e}")
-                    break
+                msg_type = data.get("type")
+                try:
+                    if msg_type == "CloseStream":
+                        connection.send_close_stream(ListenV2CloseStream(type="CloseStream"))
+                    else:
+                        print(f"Ignoring unknown client message type: {msg_type}")
+                except Exception as e:
+                    print(f"Error forwarding to Deepgram: {e}")
 
     except Exception as e:
         print(f"Error setting up Flux connection: {e}")
         try:
             ws.close(1011, "Internal server error")
-        except:
+        except Exception:
             pass
         return
 
     finally:
-        # Cleanup
-        print("Cleaning up Flux connection")
         stop_event.set()
-        try:
-            deepgram_ws.close()
-        except Exception as e:
-            print(f"Error closing Deepgram connection: {e}")
-
         print("Client disconnected from /api/flux")
 
 # ============================================================================
